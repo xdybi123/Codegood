@@ -587,11 +587,14 @@ namespace DigitalMicrograph
                 if (elementCount < expected) continue;
 
                 // Contrast limits (ImageDisplayInfo.LowLimit / HighLimit), in raw data units.
-                // ImageDisplayInfo is a sibling of ImageData within the image entry, so
-                // search the whole entry subtree.
+                // ImageDisplayInfo usually lives under root.DocumentObjectList, a separate
+                // branch from ImageList, so search the WHOLE tag tree (from root), not just
+                // this image entry. This mirrors the Fiji DM3_Reader, which matches any key
+                // ending in "ImageDisplayInfo.LowLimit" / ".HighLimit".
                 double cLow = double.NaN, cHigh = double.NaN;
                 bool hasLimits = false;
-                TagNode displayInfo = FindDescendant(entry, "ImageDisplayInfo");
+                TagNode displayInfo = FindDescendant(root, "ImageDisplayInfo");
+                if (displayInfo == null) displayInfo = FindDescendant(entry, "ImageDisplayInfo");
                 if (displayInfo != null)
                 {
                     object lo = GetLeafValue(displayInfo, "LowLimit");
