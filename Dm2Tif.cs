@@ -136,6 +136,14 @@ class Dm2Tif
                         img.PixelSizeX, img.PixelSizeUnitX,
                         img.PixelSizeY, img.PixelSizeUnitY,
                         outPath);
+
+                    if (img.HasContrastLimits)
+                        Console.WriteLine(
+                            "        contrast limits (raw units): low={0:G6}  high={1:G6}",
+                            img.ContrastLow, img.ContrastHigh);
+                    else
+                        Console.WriteLine(
+                            "        contrast: auto (min/max); no limits stored in file");
                 }
                 catch (Exception ex)
                 {
