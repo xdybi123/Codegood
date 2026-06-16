@@ -54,6 +54,12 @@ namespace DigitalMicrograph
         public int Height { get; internal set; }
         /// <summary>Raw DM image data-type code (1=int16, 2=float32, 6=uint8, 7=int32, 10=uint16, ...).</summary>
         public int DataType { get; internal set; }
+        /// <summary>Display contrast low limit from ImageDisplayInfo.LowLimit, in raw data units. NaN if absent.</summary>
+        public double ContrastLow { get; internal set; }
+        /// <summary>Display contrast high limit from ImageDisplayInfo.HighLimit, in raw data units. NaN if absent.</summary>
+        public double ContrastHigh { get; internal set; }
+        /// <summary>True when both contrast limits were found in the file and used for normalisation.</summary>
+        public bool HasContrastLimits { get; internal set; }
     }
 
     // =========================================================================
@@ -580,19 +586,43 @@ namespace DigitalMicrograph
                 // For stacks, elementCount may be width*height*depth; clamp to first slice.
                 if (elementCount < expected) continue;
 
-                Bitmap bmp = BuildBitmap(dataNode.DataOffset, width, height, dataType);
+                // Contrast limits (ImageDisplayInfo.LowLimit / HighLimit), in raw data units.
+                // ImageDisplayInfo is a sibling of ImageData within the image entry, so
+                // search the whole entry subtree.
+                double cLow = double.NaN, cHigh = double.NaN;
+                bool hasLimits = false;
+                TagNode displayInfo = FindDescendant(entry, "ImageDisplayInfo");
+                if (displayInfo != null)
+                {
+                    object lo = GetLeafValue(displayInfo, "LowLimit");
+                    object hi = GetLeafValue(displayInfo, "HighLimit");
+                    if (lo != null && hi != null)
+                    {
+                        cLow  = ToDouble(lo);
+                        cHigh = ToDouble(hi);
+                        // Only use them if they form a valid, non-degenerate range.
+                        if (!double.IsNaN(cLow) && !double.IsNaN(cHigh) && cHigh > cLow)
+                            hasLimits = true;
+                    }
+                }
+
+                Bitmap bmp = BuildBitmap(dataNode.DataOffset, width, height, dataType,
+                                         hasLimits, cLow, cHigh);
                 if (bmp == null) continue;
 
                 Images.Add(new DmImage
                 {
-                    Bitmap         = bmp,
-                    Width          = width,
-                    Height         = height,
-                    DataType       = dataType,
-                    PixelSizeX     = pxX,
-                    PixelSizeY     = pxY,
-                    PixelSizeUnitX = unitX,
-                    PixelSizeUnitY = unitY,
+                    Bitmap            = bmp,
+                    Width             = width,
+                    Height            = height,
+                    DataType          = dataType,
+                    PixelSizeX        = pxX,
+                    PixelSizeY        = pxY,
+                    PixelSizeUnitX    = unitX,
+                    PixelSizeUnitY    = unitY,
+                    ContrastLow       = cLow,
+                    ContrastHigh      = cHigh,
+                    HasContrastLimits = hasLimits,
                 });
             }
         }
@@ -601,7 +631,8 @@ namespace DigitalMicrograph
         // Bitmap construction (normalised 8-bit greyscale, Format8bppIndexed)
         // =====================================================================
 
-        private Bitmap BuildBitmap(long dataOffset, int width, int height, int dataType)
+        private Bitmap BuildBitmap(long dataOffset, int width, int height, int dataType,
+                                   bool hasLimits, double contrastLow, double contrastHigh)
         {
             int n = width * height;
             int bytesPerPixel = ImageDataTypeBytes(dataType);
@@ -610,8 +641,7 @@ namespace DigitalMicrograph
             byte[] raw = ReadBytesAt(dataOffset, (long)n * bytesPerPixel);
             if (raw == null) return null;
 
-            // Build a float intensity array (RGBA collapsed to luminance), then
-            // min/max-normalise to 8-bit greyscale.
+            // Build a float intensity array (RGBA collapsed to luminance).
             float[] intensity = new float[n];
             switch (dataType)
             {
@@ -635,13 +665,25 @@ namespace DigitalMicrograph
                 default: return null;
             }
 
-            float min = float.MaxValue, max = float.MinValue;
-            for (int i = 0; i < n; i++)
+            // Determine the value range used for 0..255 mapping.
+            // If the file provides display contrast limits, use them (matching how
+            // DigitalMicrograph renders the image); otherwise use the data min/max.
+            float min, max;
+            if (hasLimits)
             {
-                float v = intensity[i];
-                if (float.IsNaN(v) || float.IsInfinity(v)) continue;
-                if (v < min) min = v;
-                if (v > max) max = v;
+                min = (float)contrastLow;
+                max = (float)contrastHigh;
+            }
+            else
+            {
+                min = float.MaxValue; max = float.MinValue;
+                for (int i = 0; i < n; i++)
+                {
+                    float v = intensity[i];
+                    if (float.IsNaN(v) || float.IsInfinity(v)) continue;
+                    if (v < min) min = v;
+                    if (v > max) max = v;
+                }
             }
             float range = max - min;
 
@@ -662,9 +704,18 @@ namespace DigitalMicrograph
                     for (int x = 0; x < width; x++)
                     {
                         float v = intensity[y * width + x];
-                        byte g = (float.IsNaN(v) || float.IsInfinity(v))
-                            ? (byte)0
-                            : (range > 0f ? (byte)Math.Round((v - min) / range * 255f) : (byte)0);
+                        byte g;
+                        if (float.IsNaN(v) || float.IsInfinity(v) || range <= 0f)
+                        {
+                            g = 0;
+                        }
+                        else
+                        {
+                            // Clip to [min, max] then scale to 0..255.
+                            float t = (v - min) / range;
+                            if (t < 0f) t = 0f; else if (t > 1f) t = 1f;
+                            g = (byte)Math.Round(t * 255f);
+                        }
                         rowbuf[x] = g;
                     }
                     Marshal.Copy(rowbuf, 0, (IntPtr)(bd.Scan0.ToInt64() + y * stride), stride);
@@ -701,6 +752,22 @@ namespace DigitalMicrograph
             foreach (TagNode c in parent.Children)
                 if (string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase))
                     return c;
+            return null;
+        }
+
+        /// <summary>Depth-first search for a group node with the given name anywhere under <paramref name="parent"/>.</summary>
+        private TagNode FindDescendant(TagNode parent, string name)
+        {
+            foreach (TagNode c in parent.Children)
+            {
+                if (string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase))
+                    return c;
+                if (c.IsGroup)
+                {
+                    TagNode hit = FindDescendant(c, name);
+                    if (hit != null) return hit;
+                }
+            }
             return null;
         }
 
