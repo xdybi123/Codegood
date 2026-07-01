@@ -1,8 +1,9 @@
 // DigitalMicrographLib.cs
 // C# 4.0 library for reading Gatan Digital Micrograph DM3/DM4 files.
 // Focuses on image extraction and pixel-size calibration.
-// Pixel data is normalised and stored in RAM as an 8-bit greyscale
-// System.Drawing.Bitmap (Format8bppIndexed).
+// Pixel data is normalised (using the file's display contrast limits when
+// present) and stored in RAM as a 1-D 8-bit greyscale byte array.
+// No System.Drawing dependency.
 //
 // DM format reference: http://www.er-c.org/cbb/info/dmformat/
 // Faithfully ported from the open-source RosettaSciIO / HyperSpy DM reader
@@ -18,15 +19,12 @@
 //   {
 //       Console.WriteLine("{0}x{1}", img.Width, img.Height);
 //       Console.WriteLine("pixel size X: {0} {1}", img.PixelSizeX, img.PixelSizeUnitX);
-//       img.Bitmap.Save("out.tif", System.Drawing.Imaging.ImageFormat.Tiff);
+//       byte[] gray = img.Pixels; // row-major, 0-255, length Width*Height
 //   }
 
 using System;
 using System.Collections.Generic;
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Text;
 
 namespace DigitalMicrograph
@@ -38,8 +36,8 @@ namespace DigitalMicrograph
     /// <summary>One image extracted from a DM3/DM4 file.</summary>
     public class DmImage
     {
-        /// <summary>8-bit greyscale bitmap (Format8bppIndexed) held entirely in RAM.</summary>
-        public Bitmap Bitmap { get; internal set; }
+        /// <summary>Normalised 8-bit greyscale pixels, row-major (length = Width*Height), values 0-255.</summary>
+        public byte[] Pixels { get; internal set; }
         /// <summary>Pixel size of the physical calibration in X (columns).</summary>
         public double PixelSizeX { get; internal set; }
         /// <summary>Pixel size of the physical calibration in Y (rows).</summary>
@@ -609,13 +607,13 @@ namespace DigitalMicrograph
                     }
                 }
 
-                Bitmap bmp = BuildBitmap(dataNode.DataOffset, width, height, dataType,
-                                         hasLimits, cLow, cHigh);
-                if (bmp == null) continue;
+                byte[] pixels = BuildPixels(dataNode.DataOffset, width, height, dataType,
+                                            hasLimits, cLow, cHigh);
+                if (pixels == null) continue;
 
                 Images.Add(new DmImage
                 {
-                    Bitmap            = bmp,
+                    Pixels            = pixels,
                     Width             = width,
                     Height            = height,
                     DataType          = dataType,
@@ -631,10 +629,10 @@ namespace DigitalMicrograph
         }
 
         // =====================================================================
-        // Bitmap construction (normalised 8-bit greyscale, Format8bppIndexed)
+        // Pixel construction (normalised 8-bit greyscale, 1-D row-major array)
         // =====================================================================
 
-        private Bitmap BuildBitmap(long dataOffset, int width, int height, int dataType,
+        private byte[] BuildPixels(long dataOffset, int width, int height, int dataType,
                                    bool hasLimits, double contrastLow, double contrastHigh)
         {
             int n = width * height;
@@ -690,42 +688,23 @@ namespace DigitalMicrograph
             }
             float range = max - min;
 
-            // 8-bit indexed greyscale bitmap with an identity palette.
-            Bitmap bmp = new Bitmap(width, height, PixelFormat.Format8bppIndexed);
-            ColorPalette pal = bmp.Palette;
-            for (int i = 0; i < 256; i++) pal.Entries[i] = Color.FromArgb(i, i, i);
-            bmp.Palette = pal; // must reassign for the palette to take effect
-
-            BitmapData bd = bmp.LockBits(new Rectangle(0, 0, width, height),
-                                         ImageLockMode.WriteOnly, PixelFormat.Format8bppIndexed);
-            try
+            // Map each pixel to 0..255: clip to [min, max] then scale.
+            byte[] pixels = new byte[n];
+            for (int i = 0; i < n; i++)
             {
-                int stride = bd.Stride;            // may exceed width (row padding)
-                byte[] rowbuf = new byte[stride];
-                for (int y = 0; y < height; y++)
+                float v = intensity[i];
+                if (float.IsNaN(v) || float.IsInfinity(v) || range <= 0f)
                 {
-                    for (int x = 0; x < width; x++)
-                    {
-                        float v = intensity[y * width + x];
-                        byte g;
-                        if (float.IsNaN(v) || float.IsInfinity(v) || range <= 0f)
-                        {
-                            g = 0;
-                        }
-                        else
-                        {
-                            // Clip to [min, max] then scale to 0..255.
-                            float t = (v - min) / range;
-                            if (t < 0f) t = 0f; else if (t > 1f) t = 1f;
-                            g = (byte)Math.Round(t * 255f);
-                        }
-                        rowbuf[x] = g;
-                    }
-                    Marshal.Copy(rowbuf, 0, (IntPtr)(bd.Scan0.ToInt64() + y * stride), stride);
+                    pixels[i] = 0;
+                }
+                else
+                {
+                    float t = (v - min) / range;
+                    if (t < 0f) t = 0f; else if (t > 1f) t = 1f;
+                    pixels[i] = (byte)Math.Round(t * 255f);
                 }
             }
-            finally { bmp.UnlockBits(bd); }
-            return bmp;
+            return pixels;
         }
 
         private byte[] ReadBytesAt(long offset, long length)

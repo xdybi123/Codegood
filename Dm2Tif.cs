@@ -1,6 +1,8 @@
 // Dm2Tif.cs
-// Console application: converts DM3/DM4 files to TIFF.
+// Console application: converts DM3/DM4 files to 8-bit greyscale TIFF.
 // Requires DigitalMicrographLib.cs (same project or referenced DLL).
+// No System.Drawing dependency: TIFFs are written directly from the
+// library's 1-D 8-bit greyscale pixel array.
 //
 // Compile example (C# 4.0 / .NET 4):
 //   csc /target:exe /out:Dm2Tif.exe Dm2Tif.cs DigitalMicrographLib.cs
@@ -8,16 +10,13 @@
 // Usage:
 //   Dm2Tif.exe input.dm3
 //   Dm2Tif.exe input.dm4 output_prefix
-//   Dm2Tif.exe *.dm3          (glob expansion performed by the shell or see below)
+//   Dm2Tif.exe *.dm3
 //
-// If the file contains more than one image the output files are named:
-//   <outputPrefix>_0.tif, <outputPrefix>_1.tif, …
-// If only one image is found the suffix is omitted:
-//   <outputPrefix>.tif
+// Multiple images in one file → <prefix>_0.tif, <prefix>_1.tif, …
+// Single image → <prefix>.tif
 
 using System;
 using System.Collections.Generic;
-using System.Drawing.Imaging;
 using System.IO;
 using DigitalMicrograph;
 
@@ -25,14 +24,8 @@ class Dm2Tif
 {
     static int Main(string[] args)
     {
-        if (args.Length == 0)
-        {
-            PrintUsage();
-            return 1;
-        }
+        if (args.Length == 0) { PrintUsage(); return 1; }
 
-        // Collect input files (support simple *.dm3 / *.dm4 globs on Windows,
-        // where the shell does not expand wildcards automatically).
         List<string> inputFiles = new List<string>();
         string outputPrefix = null;
 
@@ -42,8 +35,8 @@ class Dm2Tif
             bool isGlob = a.IndexOf('*') >= 0 || a.IndexOf('?') >= 0;
             if (isGlob)
             {
-                string dir  = Path.GetDirectoryName(a);
-                string pat  = Path.GetFileName(a);
+                string dir = Path.GetDirectoryName(a);
+                string pat = Path.GetFileName(a);
                 if (string.IsNullOrEmpty(dir)) dir = ".";
                 try
                 {
@@ -58,8 +51,7 @@ class Dm2Tif
             }
             else if (i == args.Length - 1 && inputFiles.Count > 0)
             {
-                // Last argument with no glob and inputs already collected → treat as prefix
-                outputPrefix = a;
+                outputPrefix = a; // last non-glob arg after inputs = output prefix
             }
             else
             {
@@ -84,15 +76,12 @@ class Dm2Tif
                 continue;
             }
 
-            // Derive default output prefix from input file name
             string prefix = outputPrefix;
             if (string.IsNullOrEmpty(prefix))
             {
                 string dir  = Path.GetDirectoryName(inputPath);
                 string stem = Path.GetFileNameWithoutExtension(inputPath);
-                prefix = string.IsNullOrEmpty(dir)
-                    ? stem
-                    : Path.Combine(dir, stem);
+                prefix = string.IsNullOrEmpty(dir) ? stem : Path.Combine(dir, stem);
             }
 
             Console.WriteLine("Reading: {0}", inputPath);
@@ -119,41 +108,30 @@ class Dm2Tif
             for (int idx = 0; idx < reader.Images.Count; idx++)
             {
                 DmImage img = reader.Images[idx];
-
-                // Build output path
                 string outPath = (reader.Images.Count == 1)
                     ? prefix + ".tif"
                     : string.Format("{0}_{1}.tif", prefix, idx);
 
                 try
                 {
-                    img.Bitmap.Save(outPath, ImageFormat.Tiff);
+                    WriteGrayTiff(outPath, img.Pixels, img.Width, img.Height);
 
                     Console.WriteLine(
                         "  Saved [{0}] {1}x{2} px  |  pixel size: {3:G6} {4} x {5:G6} {6}  →  {7}",
-                        idx,
-                        img.Width, img.Height,
+                        idx, img.Width, img.Height,
                         img.PixelSizeX, img.PixelSizeUnitX,
-                        img.PixelSizeY, img.PixelSizeUnitY,
-                        outPath);
+                        img.PixelSizeY, img.PixelSizeUnitY, outPath);
 
                     if (img.HasContrastLimits)
-                        Console.WriteLine(
-                            "        contrast limits (raw units): low={0:G6}  high={1:G6}",
-                            img.ContrastLow, img.ContrastHigh);
+                        Console.WriteLine("        contrast limits (raw units): low={0:G6}  high={1:G6}",
+                                          img.ContrastLow, img.ContrastHigh);
                     else
-                        Console.WriteLine(
-                            "        contrast: auto (min/max); no limits stored in file");
+                        Console.WriteLine("        contrast: auto (min/max); no limits stored in file");
                 }
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine("  Error saving '{0}': {1}", outPath, ex.Message);
                     exitCode = 1;
-                }
-                finally
-                {
-                    // Free bitmap memory as soon as it's saved
-                    img.Bitmap.Dispose();
                 }
             }
         }
@@ -161,28 +139,73 @@ class Dm2Tif
         return exitCode;
     }
 
+    // -------------------------------------------------------------------------
+    // Minimal baseline TIFF writer: 8-bit greyscale, little-endian, uncompressed,
+    // single strip. Layout: 8-byte header, image data, then the IFD.
+    // -------------------------------------------------------------------------
+    static void WriteGrayTiff(string path, byte[] pixels, int width, int height)
+    {
+        if (pixels == null) throw new ArgumentNullException("pixels");
+        int dataLen = width * height;
+        if (pixels.Length < dataLen) throw new ArgumentException("pixel array too small");
+
+        uint imageDataOffset = 8;
+        uint ifdOffset = (uint)(8 + dataLen);
+
+        using (FileStream fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (BinaryWriter w = new BinaryWriter(fs)) // BinaryWriter is little-endian
+        {
+            // Header
+            w.Write((byte)'I'); w.Write((byte)'I'); // little-endian byte order
+            w.Write((ushort)42);                    // TIFF magic
+            w.Write(ifdOffset);                     // offset of first IFD
+
+            // Image data (one strip, row-major, no padding)
+            w.Write(pixels, 0, dataLen);
+
+            // IFD: entries MUST be written in ascending tag order.
+            const ushort SHORT = 3, LONG = 4;
+            w.Write((ushort)9);                     // entry count
+            Entry(w, 256, LONG,  1, (uint)width);   // ImageWidth
+            Entry(w, 257, LONG,  1, (uint)height);  // ImageLength
+            Entry(w, 258, SHORT, 1, 8);             // BitsPerSample
+            Entry(w, 259, SHORT, 1, 1);             // Compression = none
+            Entry(w, 262, SHORT, 1, 1);             // Photometric = BlackIsZero
+            Entry(w, 273, LONG,  1, imageDataOffset); // StripOffsets
+            Entry(w, 277, SHORT, 1, 1);             // SamplesPerPixel
+            Entry(w, 278, LONG,  1, (uint)height);  // RowsPerStrip (whole image)
+            Entry(w, 279, LONG,  1, (uint)dataLen); // StripByteCounts
+            w.Write((uint)0);                       // next IFD offset (none)
+        }
+    }
+
+    // Writes one 12-byte IFD entry. For SHORT values the 2-byte value sits in the
+    // low bytes of the 4-byte value field, which is correct on little-endian.
+    static void Entry(BinaryWriter w, ushort tag, ushort type, uint count, uint value)
+    {
+        w.Write(tag);
+        w.Write(type);
+        w.Write(count);
+        w.Write(value);
+    }
+
     static void PrintUsage()
     {
-        Console.WriteLine("Dm2Tif — convert DM3/DM4 files to TIFF");
+        Console.WriteLine("Dm2Tif — convert DM3/DM4 files to 8-bit greyscale TIFF");
         Console.WriteLine();
         Console.WriteLine("Usage:");
         Console.WriteLine("  Dm2Tif.exe <input.dm3|dm4> [output_prefix]");
         Console.WriteLine("  Dm2Tif.exe *.dm3");
         Console.WriteLine();
         Console.WriteLine("Examples:");
-        Console.WriteLine("  Dm2Tif.exe image.dm3");
-        Console.WriteLine("    → image.tif");
-        Console.WriteLine();
-        Console.WriteLine("  Dm2Tif.exe image.dm4 converted");
-        Console.WriteLine("    → converted.tif   (or converted_0.tif, converted_1.tif … if multiple images)");
-        Console.WriteLine();
-        Console.WriteLine("  Dm2Tif.exe *.dm3");
-        Console.WriteLine("    → converts every DM3 in the current directory");
+        Console.WriteLine("  Dm2Tif.exe image.dm3            → image.tif");
+        Console.WriteLine("  Dm2Tif.exe image.dm4 converted  → converted.tif (or _0,_1… if multiple)");
+        Console.WriteLine("  Dm2Tif.exe *.dm3                → converts every DM3 in the folder");
         Console.WriteLine();
         Console.WriteLine("Notes:");
-        Console.WriteLine("  • All image types are normalised to 8-bit greyscale in the output TIFF.");
-        Console.WriteLine("  • Pixel-size calibration is printed to the console but not embedded in");
-        Console.WriteLine("    the TIFF (GDI+ does not expose DM-specific metadata tags).");
-        Console.WriteLine("  • Requires .NET 4.0 or later on Windows.");
+        Console.WriteLine("  • Output is 8-bit greyscale, normalised using the file's display");
+        Console.WriteLine("    contrast limits when present, otherwise the data min/max.");
+        Console.WriteLine("  • Pixel size and contrast limits are printed to the console.");
+        Console.WriteLine("  • Requires .NET 4.0 or later; no System.Drawing dependency.");
     }
 }
