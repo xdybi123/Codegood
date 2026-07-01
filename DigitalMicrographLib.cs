@@ -636,93 +636,86 @@ namespace DigitalMicrograph
                                    bool hasLimits, double contrastLow, double contrastHigh)
         {
             int n = width * height;
-            int bytesPerPixel = ImageDataTypeBytes(dataType);
-            if (bytesPerPixel == 0) return null; // unsupported / not implemented
+            int bpp = ImageDataTypeBytes(dataType);
+            if (bpp == 0) return null; // unsupported type
 
-            byte[] raw = ReadBytesAt(dataOffset, (long)n * bytesPerPixel);
+            byte[] raw = ReadBytesAt(dataOffset, (long)n * bpp);
             if (raw == null) return null;
 
-            // Build a float intensity array (RGBA collapsed to luminance).
-            float[] intensity = new float[n];
+            // Decode pixels to float intensity (RGBA collapsed to luminance).
+            // The Buf* helpers are allocation-free, so this is a tight loop.
+            float[] v = new float[n];
             switch (dataType)
             {
-                case 1:  for (int i = 0; i < n; i++) intensity[i] = BufI16(raw, i * 2); break; // int16
-                case 2:  for (int i = 0; i < n; i++) intensity[i] = BufF32(raw, i * 4); break; // float32
-                case 6:  for (int i = 0; i < n; i++) intensity[i] = raw[i];             break; // uint8
-                case 7:  for (int i = 0; i < n; i++) intensity[i] = BufI32(raw, i * 4); break; // int32
-                case 9:  for (int i = 0; i < n; i++) intensity[i] = (sbyte)raw[i];      break; // int8
-                case 10: for (int i = 0; i < n; i++) intensity[i] = BufU16(raw, i * 2); break; // uint16
-                case 11: for (int i = 0; i < n; i++) intensity[i] = BufU32(raw, i * 4); break; // uint32
-                case 12: for (int i = 0; i < n; i++) intensity[i] = (float)BufF64(raw, i * 8); break; // float64
-                case 14: for (int i = 0; i < n; i++) intensity[i] = raw[i] != 0 ? 1f : 0f; break; // bool
-                case 8:  // RGBA (B,G,R,A): luminance
-                case 23:
-                    for (int i = 0; i < n; i++)
-                    {
-                        int o = i * 4;
-                        intensity[i] = 0.299f * raw[o + 2] + 0.587f * raw[o + 1] + 0.114f * raw[o];
-                    }
+                case 1:  for (int i = 0; i < n; i++) v[i] = BufI16(raw, i * 2); break;         // int16
+                case 2:  for (int i = 0; i < n; i++) v[i] = BufF32(raw, i * 4); break;         // float32
+                case 6:  for (int i = 0; i < n; i++) v[i] = raw[i];            break;          // uint8
+                case 7:  for (int i = 0; i < n; i++) v[i] = BufI32(raw, i * 4); break;         // int32
+                case 9:  for (int i = 0; i < n; i++) v[i] = (sbyte)raw[i];     break;          // int8
+                case 10: for (int i = 0; i < n; i++) v[i] = BufU16(raw, i * 2); break;         // uint16
+                case 11: for (int i = 0; i < n; i++) v[i] = BufU32(raw, i * 4); break;         // uint32
+                case 12: for (int i = 0; i < n; i++) v[i] = (float)BufF64(raw, i * 8); break;  // float64
+                case 14: for (int i = 0; i < n; i++) v[i] = raw[i] != 0 ? 1f : 0f; break;      // bool
+                case 8:  case 23:                                                              // RGBA (B,G,R,A)
+                    for (int i = 0; i < n; i++) { int o = i * 4; v[i] = 0.299f*raw[o+2] + 0.587f*raw[o+1] + 0.114f*raw[o]; }
                     break;
                 default: return null;
             }
 
-            // Determine the value range used for 0..255 mapping.
-            // If the file provides display contrast limits, use them (matching how
-            // DigitalMicrograph renders the image); otherwise use the data min/max.
+            // Normalisation range: display contrast limits if present (matching how
+            // DigitalMicrograph renders), otherwise the actual data min/max.
             float min, max;
             if (hasLimits)
             {
-                min = (float)contrastLow;
-                max = (float)contrastHigh;
+                min = (float)contrastLow; max = (float)contrastHigh;
             }
             else
             {
                 min = float.MaxValue; max = float.MinValue;
                 for (int i = 0; i < n; i++)
                 {
-                    float v = intensity[i];
-                    if (float.IsNaN(v) || float.IsInfinity(v)) continue;
-                    if (v < min) min = v;
-                    if (v > max) max = v;
+                    float x = v[i];
+                    if (float.IsNaN(x) || float.IsInfinity(x)) continue;
+                    if (x < min) min = x;
+                    if (x > max) max = x;
                 }
             }
-            float range = max - min;
 
-            // Map each pixel to 0..255: clip to [min, max] then scale.
+            // Map to 0..255: clip to [min, max] then scale. Uses Math.Round to
+            // stay byte-identical to previous output (round-half-to-even).
             byte[] pixels = new byte[n];
-            for (int i = 0; i < n; i++)
+            float range = max - min;
+            if (range > 0f)
             {
-                float v = intensity[i];
-                if (float.IsNaN(v) || float.IsInfinity(v) || range <= 0f)
+                for (int i = 0; i < n; i++)
                 {
-                    pixels[i] = 0;
-                }
-                else
-                {
-                    float t = (v - min) / range;
+                    float x = v[i];
+                    if (float.IsNaN(x) || float.IsInfinity(x)) { pixels[i] = 0; continue; }
+                    float t = (x - min) / range;
                     if (t < 0f) t = 0f; else if (t > 1f) t = 1f;
                     pixels[i] = (byte)Math.Round(t * 255f);
                 }
             }
+            // range <= 0 leaves pixels all zero (flat image)
             return pixels;
         }
 
         private byte[] ReadBytesAt(long offset, long length)
         {
             if (length <= 0 || length > int.MaxValue) return null;
-            using (FileStream fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            // Parsing is finished by the time this runs, so we can seek the
+            // already-open stream rather than opening the file a second time.
+            Stream s = _br.BaseStream;
+            s.Seek(offset, SeekOrigin.Begin);
+            byte[] buf = new byte[length];
+            int done = 0, len = (int)length;
+            while (done < len)
             {
-                fs.Seek(offset, SeekOrigin.Begin);
-                byte[] buf = new byte[length];
-                int done = 0, len = (int)length;
-                while (done < len)
-                {
-                    int r = fs.Read(buf, done, len - done);
-                    if (r == 0) return null;
-                    done += r;
-                }
-                return buf;
+                int r = s.Read(buf, done, len - done);
+                if (r == 0) return null;
+                done += r;
             }
+            return buf;
         }
 
         // =====================================================================
@@ -806,15 +799,28 @@ namespace DigitalMicrograph
         }
 
         // =====================================================================
-        // Buffer-level endian-aware readers (for extracted pixel byte arrays)
+        // Buffer-level endian-aware readers (allocation-free)
         // =====================================================================
 
-        private short  BufI16(byte[] b, int o){byte[] t={b[o],b[o+1]};if(!_littleEndian)Array.Reverse(t);return BitConverter.ToInt16(t,0);}
-        private ushort BufU16(byte[] b, int o){byte[] t={b[o],b[o+1]};if(!_littleEndian)Array.Reverse(t);return BitConverter.ToUInt16(t,0);}
-        private int    BufI32(byte[] b, int o){byte[] t={b[o],b[o+1],b[o+2],b[o+3]};if(!_littleEndian)Array.Reverse(t);return BitConverter.ToInt32(t,0);}
-        private uint   BufU32(byte[] b, int o){byte[] t={b[o],b[o+1],b[o+2],b[o+3]};if(!_littleEndian)Array.Reverse(t);return BitConverter.ToUInt32(t,0);}
-        private float  BufF32(byte[] b, int o){byte[] t={b[o],b[o+1],b[o+2],b[o+3]};if(!_littleEndian)Array.Reverse(t);return BitConverter.ToSingle(t,0);}
-        private double BufF64(byte[] b, int o){byte[] t=new byte[8];Array.Copy(b,o,t,0,8);if(!_littleEndian)Array.Reverse(t);return BitConverter.ToDouble(t,0);}
+        private short  BufI16(byte[] b, int o){ return (short)BufU16(b,o); }
+        private ushort BufU16(byte[] b, int o){ return _littleEndian ? (ushort)(b[o] | (b[o+1]<<8)) : (ushort)(b[o+1] | (b[o]<<8)); }
+        private int    BufI32(byte[] b, int o){ return (int)BufU32(b,o); }
+        private uint   BufU32(byte[] b, int o){ return _littleEndian ? (uint)(b[o] | (b[o+1]<<8) | (b[o+2]<<16) | (b[o+3]<<24)) : (uint)(b[o+3] | (b[o+2]<<8) | (b[o+1]<<16) | (b[o]<<24)); }
+        // Float readers: no allocation when file endianness matches the CPU
+        // (the usual case); otherwise fall back to a small reversed copy.
+        private float  BufF32(byte[] b, int o)
+        {
+            if (_littleEndian == BitConverter.IsLittleEndian) return BitConverter.ToSingle(b, o);
+            byte[] t = { b[o+3], b[o+2], b[o+1], b[o] };
+            return BitConverter.ToSingle(t, 0);
+        }
+        private double BufF64(byte[] b, int o)
+        {
+            if (_littleEndian == BitConverter.IsLittleEndian) return BitConverter.ToDouble(b, o);
+            byte[] t = { b[o+7], b[o+6], b[o+5], b[o+4], b[o+3], b[o+2], b[o+1], b[o] };
+            return BitConverter.ToDouble(t, 0);
+        }
+        private long   BufI64(byte[] b, int o){ return _littleEndian ? ((long)BufU32(b,o) | ((long)BufU32(b,o+4)<<32)) : ((long)BufU32(b,o+4) | ((long)BufU32(b,o)<<32)); }
 
         // =====================================================================
         // Stream-level endian-aware readers
